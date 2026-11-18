@@ -99,6 +99,7 @@ public:
         results.thread_throughputs.resize(config_.num_book_threads, 0);
 
         OrderJournal journal;
+        journal.set_consumer_count(config_.num_book_threads);
         std::atomic<bool> producer_done{false};
         std::vector<ShardedBookManager> shard_managers(config_.num_book_threads);
         std::vector<std::thread> consumers;
@@ -119,34 +120,35 @@ public:
         // --- STAGE 2: Book Builder Threads ---
         auto start_time = std::chrono::high_resolution_clock::now();
 
-        // Thread 0 also does latency measurement (first consumer to read)
+        // Consumer threads with local-cached sequence (reduces atomic loads)
         for (size_t t = 0; t < config_.num_book_threads; t++) {
             consumers.emplace_back([&, t]() {
                 pin_to_core(static_cast<int>(t + 1));
 
                 size_t local_seq = 0;
+                size_t cached_published = 0;
                 size_t local_count = 0;
 
                 while (true) {
-                    size_t published = journal.get_published_index();
-
-                    if (local_seq >= published) {
-                        if (producer_done.load(std::memory_order_acquire) &&
-                            local_seq >= journal.get_published_index()) {
-                            break;
+                    if (local_seq >= cached_published) {
+                        cached_published = journal.get_published_index();
+                        if (local_seq >= cached_published) {
+                            if (producer_done.load(std::memory_order_acquire) &&
+                                local_seq >= journal.get_published_index()) {
+                                break;
+                            }
+                            cpu_pause();
+                            continue;
                         }
-                        cpu_pause();
-                        continue;
                     }
 
-                    while (local_seq < published) {
+                    while (local_seq < cached_published) {
                         const DecodedOrder& order = journal.get_payload<DecodedOrder>(local_seq);
 
                         if (get_shard(order.ticker_key) == t) {
                             shard_managers[t].apply(order);
                             local_count++;
 
-                            // True e2e latency: consumer read time - producer publish time
                             if (config_.measure_latency && t == 0 && (local_seq % 1000 == 0)) {
                                 auto now = std::chrono::high_resolution_clock::now();
                                 uint64_t consume_ns = static_cast<uint64_t>(
@@ -161,25 +163,34 @@ public:
                         local_seq++;
                     }
 
-                    // Report progress for backpressure support
-                    journal.report_consumer_progress(local_seq);
+                    journal.report_consumer_progress(t, local_seq);
                 }
 
                 results.thread_message_counts[t] = local_count;
             });
         }
 
-        // --- STAGE 1: Producer (Decoder → Journal) ---
+        // --- STAGE 1: Producer (Decoder → Journal, batched publish) ---
+        static constexpr size_t PUBLISH_BATCH = 64;
         auto decode_start = std::chrono::high_resolution_clock::now();
 
         for (size_t i = 0; i < num_orders; i++) {
+            // Lossless gating: spin until writing slot i cannot lap the
+            // slowest consumer. Without this, runs longer than the ring
+            // capacity would silently overwrite unread slots.
+            while (!journal.can_publish(i)) {
+                cpu_pause();
+            }
             if (config_.measure_latency) {
                 auto now = std::chrono::high_resolution_clock::now();
                 publish_ts[i] = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         now - start_time).count());
             }
-            journal.publish(i, orders[i]);
+            journal.publish_payload(i, orders[i]);
+            if ((i + 1) % PUBLISH_BATCH == 0 || i == num_orders - 1) {
+                journal.publish_fence(i + 1);
+            }
         }
 
         auto decode_end = std::chrono::high_resolution_clock::now();

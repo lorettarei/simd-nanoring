@@ -557,14 +557,131 @@ void experiment_book_throughput(const TestData& data) {
 }
 
 // ============================================================
-// EXPERIMENT 6: BROADCAST vs ROUTED PIPELINE
+// EXPERIMENT 6: BATCHED PUBLISH + CONSUMER CACHING
+// Tests two optimizations that reduce MESI invalidation fan-out:
+// 1. Batched publish: write N payloads, update atomic ONCE
+// 2. Consumer-local caching: load atomic once, drain locally
+// ============================================================
+
+void experiment_batched_journal(const TestData& data) {
+    std::cout << "\n" << std::string(70, '=') << "\n";
+    std::cout << "EXPERIMENT 6: Journal Optimizations (Batched Publish + Cached Read)\n";
+    std::cout << std::string(70, '=') << "\n";
+
+    size_t n = data.orders.size();
+    std::vector<int> thread_counts = {1, 2, 4, 8};
+
+    // --- Baseline: naive publish (atomic store per message) ---
+    std::cout << "\n  [Baseline — atomic store per message, consumer loads per spin]\n";
+    for (int num_consumers : thread_counts) {
+        BroadcastJournal<131072> journal;
+        std::atomic<bool> done{false};
+        std::vector<size_t> consumer_reads(num_consumers, 0);
+
+        auto start = std::chrono::high_resolution_clock::now();
+
+        std::vector<std::thread> consumers;
+        for (int c = 0; c < num_consumers; c++) {
+            consumers.emplace_back([&, c]() {
+                pin_to_core(c + 1);
+                size_t local_seq = 0;
+                while (true) {
+                    size_t pub = journal.get_published_index();
+                    if (local_seq >= pub) {
+                        if (done.load(std::memory_order_acquire)) break;
+                        cpu_pause();
+                        continue;
+                    }
+                    while (local_seq < pub) {
+                        volatile auto& payload = journal.get_payload<DecodedOrder>(local_seq);
+                        (void)payload;
+                        local_seq++;
+                    }
+                }
+                consumer_reads[c] = local_seq;
+            });
+        }
+
+        for (size_t i = 0; i < n; i++) {
+            journal.publish(i, data.orders[i]);
+        }
+        done.store(true, std::memory_order_release);
+
+        for (auto& t : consumers) t.join();
+        auto end = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+        std::string cfg = "Naive (" + std::to_string(num_consumers) + " consumers)";
+        record_result("Journal Opts", cfg, n, ms);
+    }
+
+    // --- Optimized: batched publish + consumer-local caching ---
+    std::cout << "\n  [Optimized — batch-64 publish + consumer caches available count]\n";
+    for (int num_consumers : thread_counts) {
+        BroadcastJournal<131072> journal;
+        std::atomic<bool> done{false};
+        std::vector<size_t> consumer_reads(num_consumers, 0);
+
+        auto start = std::chrono::high_resolution_clock::now();
+
+        // Consumers with local caching: load atomic ONCE, drain batch locally
+        std::vector<std::thread> consumers;
+        for (int c = 0; c < num_consumers; c++) {
+            consumers.emplace_back([&, c]() {
+                pin_to_core(c + 1);
+                size_t local_seq = 0;
+                size_t cached_published = 0;  // only re-load atomic when drained
+
+                while (true) {
+                    if (local_seq >= cached_published) {
+                        // Only touch the atomic when we've drained everything
+                        cached_published = journal.get_published_index();
+                        if (local_seq >= cached_published) {
+                            if (done.load(std::memory_order_acquire)) break;
+                            cpu_pause();
+                            continue;
+                        }
+                    }
+
+                    // Drain locally — no atomic load in this inner loop
+                    while (local_seq < cached_published) {
+                        volatile auto& payload = journal.get_payload<DecodedOrder>(local_seq);
+                        (void)payload;
+                        local_seq++;
+                    }
+                }
+                consumer_reads[c] = local_seq;
+            });
+        }
+
+        // Producer: batched publish (write 64 payloads, one atomic store)
+        static constexpr size_t BATCH = 64;
+        for (size_t i = 0; i < n; i++) {
+            journal.publish_payload(i, data.orders[i]);
+            if ((i + 1) % BATCH == 0 || i == n - 1) {
+                journal.publish_fence(i + 1);
+            }
+        }
+        done.store(true, std::memory_order_release);
+
+        for (auto& t : consumers) t.join();
+        auto end = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+        std::string cfg = "Batched-64 + cached (" + std::to_string(num_consumers) + " consumers)";
+        record_result("Journal Opts", cfg, n, ms);
+    }
+}
+
+// ============================================================
+// EXPERIMENT 7: BROADCAST vs ROUTED PIPELINE
 // Compares broadcast (all consumers read all) vs producer-routed
 // (each consumer only reads its shard). Tests scaling efficiency.
 // ============================================================
 
 void experiment_broadcast_vs_routed(const TestData& data) {
     std::cout << "\n" << std::string(70, '=') << "\n";
-    std::cout << "EXPERIMENT 6: Broadcast Pipeline vs Routed Pipeline\n";
+    std::cout << "EXPERIMENT 7: Broadcast Pipeline vs Routed Pipeline\n";
     std::cout << std::string(70, '=') << "\n";
 
     size_t n = data.orders.size();
@@ -705,6 +822,7 @@ int main() {
     experiment_pipeline_scaling(data);
     experiment_latency(data);
     experiment_book_throughput(data);
+    experiment_batched_journal(data);
     experiment_broadcast_vs_routed(data);
 
     write_results_markdown();

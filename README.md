@@ -28,8 +28,9 @@ The system processes a raw NASDAQ ITCH 5.0 binary feed through a multi-stage pip
 │  Lock-Free Broadcast Journal (LMAX Disruptor Pattern)               │
 │  • Producer writes once; N consumers read independently             │
 │  • MESI Shared state — no cache invalidation storms                 │
-│  • Backpressure via consumer progress tracking                      │
-│  • Transit latency: P50=83ns, P99=84ns                              │
+│  • Batched publish: 1 atomic store per 64 messages (4.4x scaling)   │
+│  • Consumer-local caching: drain batch without touching atomic      │
+│  • Transit latency: P50=42ns, P99=84ns                              │
 └───────┬─────────┬─────────┬─────────┬──────────────────────────────┘
         │         │         │         │
         ▼         ▼         ▼         ▼  [Cores 1..N — Sharded Books]
@@ -116,14 +117,23 @@ Task: "find all AAPL orders with price > $30.00" — a realistic strategy/risk f
 
 ### Broadcast Journal Scaling
 
-| Consumers | Time (ms) | Per-Consumer Throughput (Mpps) | Total Reads |
-|---:|---:|---:|---:|
-| 1 | 53.50 | 373.82 | 20M |
-| 2 | 70.35 | 284.29 | 40M |
-| 4 | 102.23 | 195.64 | 80M |
-| 8 | 256.15 | 78.08 | 160M |
+**Naive (atomic store per message):**
 
-Each consumer independently reads all 20M messages. Total work scales linearly (N x 20M) while wall-clock degrades sub-linearly — proving the Shared MESI state design works.
+| Consumers | Time (ms) | Throughput (Mpps) |
+|---:|---:|---:|
+| 1 | 74.12 | 269.82 |
+| 4 | 94.47 | 211.71 |
+| 8 | 285.37 | 70.08 |
+
+**Optimized (batch-64 publish + consumer-local caching):**
+
+| Consumers | Time (ms) | Throughput (Mpps) | vs Naive |
+|---:|---:|---:|---:|
+| 1 | 24.43 | 818.53 | 3.0x |
+| 4 | 25.58 | 781.93 | 3.7x |
+| 8 | 65.48 | 305.44 | 4.4x |
+
+Batching reduces MESI invalidation fan-out: one atomic store per 64 messages instead of per message. Consumer-local caching avoids re-loading the atomic until the local batch is drained. Result: **nearly flat scaling up to 4 consumers** (819 → 782 Mpps).
 
 ### End-to-End Pipeline (Full System)
 
